@@ -38,52 +38,125 @@ export default class ID3Parser{
    * @returns {ID3Header|Object} An ID3Header object for ID3v2 tags, or an object with the parsed ID3v1 tag data
    */
   parseHeader(){
-    if(ID3Parser.isID3v1(this.#view)){
-      const view = new DataView(this.#view.buffer, this.#view.byteLength - 128, 128)
-      const decoder = new TextDecoder()
+    let offset
 
-      const title = decoder.decode(view.buffer.slice(view.byteOffset + 3, view.byteOffset + 33)).replace(/\0/g, '')
-      const artist = decoder.decode(view.buffer.slice(view.byteOffset + 33, view.byteOffset + 63)).replace(/\0/g, '')
-      const album = decoder.decode(view.buffer.slice(view.byteOffset + 63, view.byteOffset + 93)).replace(/\0/g, '')
-      const year = decoder.decode(view.buffer.slice(view.byteOffset + 93, view.byteOffset + 97)).replace(/\0/g, '')
-  
+    if(!ID3Parser.isID3v2(this.#view) && ID3Parser.isID3v1(this.#view)){
+      const buffer = this.#view.buffer
+      const view = new DataView(buffer, buffer.byteLength - 128, 128)
+      const decoder = new TextDecoder()
+      
+      offset = view.byteOffset
+
+      const title = decoder.decode(buffer.slice(offset + 3, offset + 33)).replace(/\0/g, '')
+      const artist = decoder.decode(buffer.slice(offset + 33, offset + 63)).replace(/\0/g, '')
+      const album = decoder.decode(buffer.slice(offset + 63, offset + 93)).replace(/\0/g, '')
+      const year = decoder.decode(buffer.slice(offset + 93, offset + 97)).replace(/\0/g, '')
+
+      // If the comment field is 30 bytes long, the last byte is the track number if the second to last byte is 0
       if(view.getUint8(125) === 0 && view.getUint8(126) !== 0){
-        const comment = decoder.decode(view.buffer.slice(97, 125)).replace(/\0/g, '')
+        const comment = decoder.decode(buffer.slice(offset + 97, offset + 125)).replace(/\0/g, '')
         const track = view.getUint8(126)
 
         return { title, artist, album, year, comment, track }
       }
       else{
-        const comment = decoder.decode(view.buffer.slice(97, 127)).replace(/\0/g, '')
+        const comment = decoder.decode(buffer.slice(offset + 97, offset + 127)).replace(/\0/g, '')
 
         return { title, artist, album, year, comment }
       }
     }
     else{
-      const version = this.#view.getUint8(3)
-      const revision = this.#view.getUint8(4)
-      const flags = this.#view.getUint8(5) // #todo: We don't care about the flags for now
-      const size = readSyncSafeInteger(this.#view, 6)
-    
+      let offset = 0
+
+      const buffer = this.#view.buffer
+      const view = new DataView(buffer, this.#view.byteOffset + 3) // Skip the "ID3" identifier
+      
+      const version = view.getUint8(offset++)
+      const revision = view.getUint8(offset++)
+      const flags = view.getUint8(offset++) // #todo: We don't care about the flags for now
+      const size = readSyncSafeInteger(view, 3)
+
+      offset += 4
+
       let extendedHeader = null
 
       // If the extended header flag is set, we need to parse the extended header
       if((version === 3 || version === 4) && (flags & 0x40)){
         if(version === 3){
-          const extendedHeaderSize = this.#view.getUint32(10)
-          
-          extendedHeader = {
-            size: extendedHeaderSize,
-            data: new DataView(this.#view.buffer, this.#view.byteOffset + 14, extendedHeaderSize)
-          }
-        }
-        else{
-          const extendedHeaderSize = readSyncSafeInteger(this.#view, 10)
+          const extendedHeaderSize = view.getUint32(offset)
+          offset += 4
+
+          const extendedFlags = view.getUint16(offset)
+          offset += 2
+
+          const paddingSize = view.getUint32(offset)
+          offset += 4
 
           extendedHeader = {
             size: extendedHeaderSize,
-            data: new DataView(this.#view.buffer, this.#view.byteOffset + 14, extendedHeaderSize - 4)
+            flags : {
+              crc : !!(extendedFlags & 0x8000)
+            },
+            paddingSize
           }
+
+          if(extendedHeader.flags.crc){
+            const crc = view.getUint32(offset)
+            offset += 4
+
+            extendedHeader.crc = {
+              length: 4,
+              value: crc
+            }
+          }
+
+          extendedHeader.size = offset - 7 
+        }
+        else{
+          const extendedHeaderSize = readSyncSafeInteger(view, offset)
+
+          offset += 4
+          offset += 1 // Skip the extended flags size
+
+          const extendedFlags = view.getUint8(offset++)
+
+          extendedHeader = {
+            size: extendedHeaderSize,
+            flags : {
+              update : !!(extendedFlags & 0x40),
+              crc : !!(extendedFlags & 0x20),
+              tag_restrictions : !!(extendedFlags & 0x10)
+            }
+          }
+
+          if(extendedHeader.flags.update){
+            const updateLength = view.getUint8(offset++)
+            offset += updateLength
+          }
+
+          if(extendedHeader.flags.crc){
+            const crcLength = view.getUint8(offset++)
+            const crc = readSyncSafeInteger(view, offset, crcLength)
+
+            offset += crcLength
+
+            extendedHeader.crc = {
+              length: crcLength,
+              value: crc
+            }
+          }
+
+          if(extendedHeader.flags.tag_restrictions){
+            const restrictionsLength = view.getUint8(offset++)
+            const restrictions = view.getUint8(offset++)
+
+            extendedHeader.tag_restrictions = {
+              length: restrictionsLength,
+              value: restrictions
+            }
+          }
+
+          extendedHeader.size = offset - 7 
         }
       }
 
@@ -100,52 +173,57 @@ export default class ID3Parser{
     if(header.version < 2) return null
 
     const decoder = new TextDecoder()
+    const view = new DataView(
+      this.#view.buffer, 
+      this.#view.byteOffset + 
+      (header.version === 2 ? 6 : 10) + 
+      (header.extendedHeader?.size || 0)
+    )
 
     let 
       id,
       size,
       flags = null, // flags are only present in ID3v2.3 and ID3v2.4
-      offset = this.#view.byteOffset + 10 // ID3 header is always 10 bytes long, so we start parsing frames after that
+      offset = 0 
 
-    while(offset < header.size + this.#view.byteOffset){
-      console.log(`Parsing frame at offset ${offset}...`, this.#view.byteOffset + header.size)
-      switch(header.version){
-        case 4 : 
-          console.log(this.#view.buffer.slice(offset))
+    while(offset < header.size){
+      if(view.getUint8(offset) === 0){
+        break
       }
-      break
-    //   switch(header.version){
-    //     case 2 : 
-    //       id = decoder.decode(this.#view.buffer.slice(offset, offset + 3))
-    //       offset += 3
-          
-    //       size = this.#view.getUint8(offset) << 16 | this.#view.getUint8(offset + 1) << 8 | this.#view.getUint8(offset + 2)
-    //       offset += 3
-    //     break
-    //     case 3 : 
-    //     case 4 : 
-    //       id = decoder.decode(this.#view.buffer.slice(offset, offset + 4))
-    //       offset += 4
 
-    //       if(header.version === 3){
-    //         size = this.#view.getUint32(offset)
-    //       }
-    //       else{
-    //         size = readSyncSafeInteger(this.#view, offset)
-    //       }
+      switch(header.version){
+        case 2 : 
+          id = decoder.decode(view.buffer.slice(view.byteOffset + offset, view.byteOffset + offset + 3))
+          offset += 3
 
-    //       offset += 4
+          size = view.getUint8(offset++) << 16 | view.getUint8(offset++) << 8 | view.getUint8(offset++)
+        break
+        case 3 : 
+        case 4 : 
+          id = decoder.decode(view.buffer.slice(view.byteOffset + offset, view.byteOffset + offset + 4))
+          offset += 4
 
-    //       flags = this.#view.getUint16(offset)
-    //       offset += 2
-    //     break
-    //     default :
-    //       throw new Error(`Unsupported ID3 version: ${header.version}`)
-    //   }
+          if(header.version === 3){
+            size = view.getUint32(offset)
+          }
+          else{
+            size = readSyncSafeInteger(view, offset)
+          }
 
-    //   yield { id, size, flags }
+          offset += 4
 
-    //   offset += size
+          flags = view.getUint16(offset)
+          offset += 2
+        break
+        default :
+          throw new Error(`Unsupported ID3 version: ${header.version}`)
+      }
+
+      const data = new DataView(view.buffer, view.byteOffset + offset, size)
+
+      yield { id, size, flags, data, version: header.version }
+
+      offset += size
     }
   }
 
